@@ -181,6 +181,237 @@ function sfxStart()   { playTone(440,0.1); setTimeout(()=>playTone(554,0.1),80);
 function sfxLevelUp() { for(let i=0;i<6;i++) setTimeout(()=>playTone(440+i*110,0.08),i*60); }
 
 // ============================================================
+// SID MUSIC ENGINE (3-channel tracker)
+// ============================================================
+const sid = {
+  osc: [null, null, null],
+  gain: [null, null, null],
+  master: null,
+  noiseBuf: null,
+  playing: false,
+  song: null,
+  step: 0,
+  timer: null,
+  muted: false,
+};
+
+function sidInit() {
+  if (!audioCtx || sid.master) return;
+  sid.master = audioCtx.createGain();
+  sid.master.gain.value = 0.35;
+  sid.master.connect(audioCtx.destination);
+  // Noise buffer for percussion
+  const sr = audioCtx.sampleRate;
+  const buf = audioCtx.createBuffer(1, sr, sr);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < sr; i++) d[i] = Math.random() * 2 - 1;
+  sid.noiseBuf = buf;
+  // 3 melodic channels: lead (pulse), bass (saw), arp (pulse)
+  const types = ['square', 'sawtooth', 'square'];
+  for (let i = 0; i < 3; i++) {
+    sid.gain[i] = audioCtx.createGain();
+    sid.gain[i].gain.value = 0;
+    sid.gain[i].connect(sid.master);
+    sid.osc[i] = audioCtx.createOscillator();
+    sid.osc[i].type = types[i];
+    sid.osc[i].frequency.value = 440;
+    sid.osc[i].connect(sid.gain[i]);
+    sid.osc[i].start();
+  }
+}
+
+function sidDrum(type) {
+  if (!audioCtx || !sid.noiseBuf) return;
+  const t = audioCtx.currentTime;
+  if (type === 'K') {
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(150, t);
+    o.frequency.exponentialRampToValueAtTime(30, t + 0.12);
+    g.gain.setValueAtTime(0.25, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+    o.connect(g); g.connect(sid.master);
+    o.start(t); o.stop(t + 0.15);
+  } else {
+    const s = audioCtx.createBufferSource();
+    s.buffer = sid.noiseBuf;
+    const g = audioCtx.createGain();
+    const f = audioCtx.createBiquadFilter();
+    if (type === 'S') {
+      f.type = 'bandpass'; f.frequency.value = 3000; f.Q.value = 1;
+      g.gain.setValueAtTime(0.12, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+    } else {
+      f.type = 'highpass'; f.frequency.value = 8000;
+      g.gain.setValueAtTime(0.06, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + 0.04);
+    }
+    s.connect(f); f.connect(g); g.connect(sid.master);
+    s.start(t); s.stop(t + (type === 'S' ? 0.1 : 0.04));
+  }
+}
+
+function musicPlay(name) {
+  if (!audioCtx) return;
+  musicStop();
+  sidInit();
+  const song = SONGS[name];
+  if (!song) return;
+  sid.song = song;
+  sid.step = 0;
+  sid.playing = true;
+  if (song.waves) {
+    song.waves.forEach((w, i) => { if (w && sid.osc[i]) sid.osc[i].type = w; });
+  }
+  const ms = 60000 / (song.bpm * 4);
+  sid.timer = setInterval(musicTick, ms);
+}
+
+function musicStop() {
+  sid.playing = false;
+  if (sid.timer) { clearInterval(sid.timer); sid.timer = null; }
+  if (audioCtx) {
+    const t = audioCtx.currentTime;
+    for (let i = 0; i < 3; i++) {
+      if (sid.gain[i]) {
+        sid.gain[i].gain.cancelScheduledValues(t);
+        sid.gain[i].gain.setTargetAtTime(0, t, 0.02);
+      }
+    }
+  }
+}
+
+function musicTick() {
+  if (!sid.playing || !sid.song) return;
+  const song = sid.song;
+  const t = audioCtx.currentTime;
+  const dur = 60 / (song.bpm * 4);
+  if (!sid.muted) {
+    // Melodic channels
+    for (let ch = 0; ch < 3; ch++) {
+      const pat = song.ch[ch];
+      if (!pat || pat.length === 0) continue;
+      const note = pat[sid.step % pat.length];
+      if (note === 0) continue; // sustain
+      const g = sid.gain[ch];
+      if (note < 0) {
+        g.gain.cancelScheduledValues(t);
+        g.gain.setTargetAtTime(0, t, 0.01);
+      } else {
+        const vol = song.vol[ch] || 0.06;
+        sid.osc[ch].frequency.setValueAtTime(note, t);
+        g.gain.cancelScheduledValues(t);
+        g.gain.setValueAtTime(vol, t);
+        g.gain.setTargetAtTime(vol * 0.5, t + 0.012, dur * 0.4);
+      }
+    }
+    // Drums
+    if (song.drums) {
+      const d = song.drums[sid.step % song.drums.length];
+      if (d) sidDrum(d);
+    }
+  }
+  sid.step++;
+}
+
+// M key to toggle music
+document.addEventListener('keydown', e => {
+  if (e.code === 'KeyM') {
+    sid.muted = !sid.muted;
+    if (sid.muted && audioCtx) {
+      const t = audioCtx.currentTime;
+      for (let i = 0; i < 3; i++) {
+        if (sid.gain[i]) {
+          sid.gain[i].gain.cancelScheduledValues(t);
+          sid.gain[i].gain.setValueAtTime(0, t);
+        }
+      }
+    }
+  }
+});
+
+// ============================================================
+// SONG DATA
+// Pattern values: 0 = sustain, -1 = note off, >0 = freq (Hz)
+// Drums: 'K'=kick, 'S'=snare, 'H'=hat, 0=rest
+// ============================================================
+// Frequencies: C2=65 D2=73 E2=82 F2=87 G2=98 A2=110 B2=123
+//   C3=131 D3=147 E3=165 F3=175 G3=196 A3=220 Bb3=233 B3=247
+//   C4=262 D4=294 E4=330 F4=349 G4=392 A4=440 Bb4=466 B4=494
+//   C5=523 D5=587 E5=659 F5=698 G5=784 A5=880 C6=1047
+
+const SONGS = {
+  // TITLE: "Burger Boogie" - upbeat C major diner groove
+  title: {
+    bpm: 130,
+    waves: ['square', 'sawtooth', 'square'],
+    vol: [0.07, 0.09, 0.035],
+    ch: [
+      // Lead melody - 64 steps (4 bars)
+      [ 659,0,784,0, 1047,0,784,659,  523,0,587,0, 659,0,-1,0,
+        698,0,880,0, 698,659,587,0,   784,0,587,0, 494,0,392,0,
+        440,0,523,0, 659,0,880,0,     784,0,659,0, 523,0,659,0,
+        784,0,698,659, 587,0,523,587, 659,0,784,0, 1047,0,-1,0 ],
+      // Bass - walking boogie
+      [ 131,0,131,0, 165,0,196,0,  131,0,131,0, 165,0,196,0,
+        175,0,175,0, 131,0,175,0,  196,0,196,0, 247,0,196,0,
+        220,0,220,0, 165,0,220,0,  131,0,131,0, 165,0,131,0,
+        196,0,196,0, 247,0,196,0,  131,0,131,0, 131,0,98,0 ],
+      // Arpeggio - rapid chord cycling
+      [ 262,330,392,523, 262,330,392,523,  262,330,392,523, 262,330,392,523,
+        349,440,523,698, 349,440,523,698,  392,494,587,784, 392,494,587,784,
+        440,523,659,440, 523,659,440,523,  262,330,392,523, 262,330,392,523,
+        392,494,587,784, 392,494,587,784,  262,330,392,523, 262,330,392,-1 ],
+    ],
+    drums: ['K',0,'H',0, 'S',0,'H',0, 'K','K','H',0, 'S',0,'H','H'],
+  },
+
+  // PLAY: "Grill Rush" - driving A minor intensity
+  play: {
+    bpm: 145,
+    waves: ['square', 'sawtooth', 'square'],
+    vol: [0.06, 0.09, 0.03],
+    ch: [
+      // Lead - urgent melody
+      [ 440,0,523,0, 659,0,523,440,  392,0,440,0, 523,0,-1,0,
+        587,0,698,0, 880,0,698,587,  523,0,587,0, 698,0,-1,0,
+        659,0,784,0, 494,0,659,0,    784,0,880,784, 659,0,-1,0,
+        440,0,523,659, 880,0,659,523, 440,0,659,0, 880,0,-1,0 ],
+      // Bass - pumping eighth notes
+      [ 110,0,110,0, 165,0,110,0,  110,0,110,0, 131,0,110,0,
+        147,0,147,0, 220,0,147,0,  147,0,147,0, 175,0,147,0,
+        165,0,165,0, 196,0,165,0,  165,0,165,0, 247,0,165,0,
+        110,0,110,0, 165,0,220,0,  110,0,110,0, 131,0,98,0 ],
+      // Arpeggio - minor chord cycles
+      [ 440,523,659,440, 523,659,440,523,  440,523,659,440, 523,659,440,523,
+        294,349,440,294, 349,440,294,349,  294,349,440,294, 349,440,294,349,
+        330,392,494,330, 392,494,330,392,  330,392,494,330, 392,494,330,392,
+        440,523,659,440, 523,659,440,523,  440,523,659,440, 523,659,440,-1 ],
+    ],
+    drums: ['K',0,'H','H', 'S',0,'H',0, 'K',0,'H','H', 'S',0,'K','H'],
+  },
+
+  // GAMEOVER: "Burnt Toast" - slow descending D minor sadness
+  gameover: {
+    bpm: 75,
+    waves: ['square', 'triangle', 'square'],
+    vol: [0.07, 0.08, 0],
+    ch: [
+      // Lead - descending lament
+      [ 587,0,0,0, 523,0,0,0,  466,0,0,0, 440,0,0,0,
+        392,0,0,0, 349,0,0,0,  330,0,0,0, 294,0,0,-1 ],
+      // Bass - slow roots
+      [ 147,0,0,0, 0,0,0,0,  117,0,0,0, 0,0,0,0,
+        98,0,0,0,  0,0,0,0,  110,0,0,0, 0,0,147,0 ],
+      // No arp
+      [],
+    ],
+    drums: [],
+  },
+};
+
+// ============================================================
 // INGREDIENT DEFINITIONS
 // ============================================================
 const INGREDIENTS = [
@@ -541,6 +772,11 @@ function updateTitle(dt) {
     if (conveyorItems[i].x < -50) conveyorItems.splice(i, 1);
   }
 
+  // Start title music if returning from game over (audio already initialized)
+  if (audioCtx && !sid.playing && !sid.muted) {
+    musicPlay('title');
+  }
+
   if (keyPressed('Space') || keyPressed('Enter') || keyPressed('_click')) {
     initAudio();
     sfxStart();
@@ -597,12 +833,13 @@ function drawTitle() {
     drawTextCentered('PRESS SPACE TO START', 152, C64.yellow, 1);
   }
 
-  drawTextCentered('MOVE: ARROW KEYS / MOUSE', 166, C64.lightGrey, 1);
-  drawTextCentered('CATCH INGREDIENTS IN ORDER!', 176, C64.lightGrey, 1);
+  drawTextCentered('MOVE: ARROW KEYS / MOUSE', 164, C64.lightGrey, 1);
+  drawTextCentered('CATCH INGREDIENTS IN ORDER!', 174, C64.lightGrey, 1);
+  drawTextCentered('M: TOGGLE MUSIC', 184, C64.grey, 1);
 
   // High score
   if (highScore > 0) {
-    drawTextCentered('HIGH SCORE: ' + highScore, 190, C64.cyan, 1);
+    drawTextCentered('HIGH SCORE: ' + highScore, 193, C64.cyan, 1);
   }
 
   drawBorder(C64.lightBlue);
@@ -628,6 +865,7 @@ function startGame() {
   chefMood = 'happy';
   chefTimer = 0;
   generateRecipe();
+  musicPlay('play');
 }
 
 function updatePlay(dt) {
@@ -714,6 +952,7 @@ function updatePlay(dt) {
             state = 'gameover';
             stateTime = 0;
             sfxGameOver();
+            musicPlay('gameover');
             if (score > highScore) {
               highScore = score;
               localStorage.setItem('burgerHS', highScore.toString());
@@ -784,6 +1023,9 @@ function drawPlay() {
   // Combo
   if (comboCount > 1) {
     drawText('COMBO X' + comboCount, 220, 33, C64.yellow, 1);
+  }
+  if (sid.muted) {
+    drawText('MUTED', 280, 33, C64.grey, 1);
   }
 
   // Recipe display (right side)
